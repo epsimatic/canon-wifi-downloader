@@ -12,7 +12,7 @@ This is very much a PoC / work in progress right now. Expect mony the basic down
 
 1. Run the pairing script:   
   ```bash
-  python3 itu2_pair.py
+  python3 itu2.py
   ```
 2. In Canon camera, enter **Wireless settings** → **Wi-Fi settings: Enable** → **Auto send images to computer** → **Auto send: Enable** → **OK**
 3. Connect to your Wi-Fi → **IP address set: Auto** → **OK**

@@ -7,7 +7,7 @@ Advertises the Computer device, and when the camera appears:
   * transfer mode -> downloads every object the camera announces
 
 Usage:
-    python3 itu2_pair.py [--iface-ip 192.0.2.10] [--http-port 2869] [--out downloads]
+    python3 itu2.py [--iface-ip 192.0.2.10] [--http-port 2869] [--out downloads]
 """
 
 from __future__ import annotations

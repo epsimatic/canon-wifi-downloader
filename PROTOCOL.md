@@ -550,7 +550,7 @@ The camera keeps the files; auto-send does not delete them.
 - Working implementation:
   - `itu2_discovery.py` — SSDP/UPnP advertise/search + HTTP description
   - `itu2_ptpip.py` — PTP/IP initiator, event parser, object read
-  - `itu2_pair.py` — mode-aware pair/transfer runner
+  - `itu2.py` — mode-aware pair/transfer runner
 - Capture and decoded payloads: `recon/captures/` (`README.md`, `carved/`).
 
 ---
