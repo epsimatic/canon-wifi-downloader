@@ -18,6 +18,7 @@ import socket
 import struct
 import threading
 import time
+from dataclasses import dataclass
 
 # ---- PTP/IP types ----
 T_INIT_CMD_REQ = 1
@@ -92,6 +93,28 @@ class PTPIPError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ObjectRecord:
+    """One 0xC1AB new-object notification."""
+
+    handle: int
+    size: int
+    path: str
+    format: int = 0
+    thumb_handle: int = 0
+
+
+@dataclass(frozen=True)
+class ObjectInfo:
+    """Fields decoded from a 0x9170 object-info record."""
+
+    size: int
+    format: int
+    filename: str
+    time1: str = ""
+    time2: str = ""
+
+
 class PTPIPClient:
     def __init__(
         self,
@@ -111,6 +134,8 @@ class PTPIPClient:
         self.cmd: socket.socket | None = None
         self.event: socket.socket | None = None
         self.conn_number = 0
+        self.camera_guid = ""
+        self.camera_name = ""
         self.tid = 0
         self._event_thread = None
         self._stop = threading.Event()
@@ -135,12 +160,12 @@ class PTPIPClient:
         try:
             if typ == T_INIT_CMD_REQ:
                 g = body[:16].hex()
-                nm = body[16:-4].split(b"\x00\x00")[0].decode("utf-16le", "replace")
+                nm = body[16:-4].decode("utf-16le", "replace").split("\x00")[0]
                 return f"guid={g} name={nm!r} ver={body[-4:].hex()}"
             if typ == T_INIT_CMD_ACK:
                 conn = struct.unpack_from("<I", body, 0)[0]
                 g = body[4:20].hex()
-                nm = body[20:-4].split(b"\x00\x00")[0].decode("utf-16le", "replace")
+                nm = body[20:-4].decode("utf-16le", "replace").split("\x00")[0]
                 return f"conn={conn} guid={g} name={nm!r}"
             if typ == T_INIT_EVENT_REQ:
                 return f"conn={struct.unpack_from('<I', body, 0)[0]}"
@@ -201,6 +226,12 @@ class PTPIPClient:
         if typ != T_INIT_CMD_ACK:
             raise PTPIPError(f"unexpected {TYPE_NAME.get(typ, typ)} after InitCmdReq")
         self.conn_number = struct.unpack_from("<I", b, 0)[0]
+        self.camera_guid = b[4:20].hex()
+        self.camera_name = (
+            b[20:-4].decode("utf-16le", "replace").split("\x00")[0]
+            if len(b) > 24
+            else ""
+        )
         # event socket
         self.event = socket.create_connection((self.ip, 15740), timeout=self.timeout)
         self.event.settimeout(1.0)
@@ -388,19 +419,66 @@ class PTPIPClient:
         return out
 
     @staticmethod
-    def parse_objects(events):
-        """Return [(handle, size, path), ...] from 0x9116 object records."""
+    def parse_objects(events) -> list[ObjectRecord]:
+        """Return object records from 0x9116 0xC1AB notifications."""
         objs = []
         for kind, body in events:
             if kind == 0x0000C1AB:
-                if len(body) < 16:
+                if len(body) < 24:
                     continue
                 handle = struct.unpack_from("<I", body, 0)[0]
+                obj_format = struct.unpack_from("<I", body, 4)[0]
                 size = struct.unpack_from("<I", body, 12)[0]
+                thumb_handle = struct.unpack_from("<I", body, 20)[0]
                 rest = body[24:]
                 path = rest.split(b"\x00")[0].decode("latin1", "replace")
-                objs.append((handle, size, path))
+                objs.append(
+                    ObjectRecord(
+                        handle=handle,
+                        size=size,
+                        path=path,
+                        format=obj_format,
+                        thumb_handle=thumb_handle,
+                    )
+                )
         return objs
+
+    @staticmethod
+    def _read_p16(data: bytes, pos: int) -> tuple[str, int]:
+        """Read a 1-byte-length-prefixed UTF-16LE string (length in code units)."""
+        if pos >= len(data):
+            raise ValueError("truncated string length")
+        units = data[pos]
+        pos += 1
+        end = pos + units * 2
+        if end > len(data):
+            raise ValueError("truncated string body")
+        text = data[pos:end].decode("utf-16le", "replace").rstrip("\x00")
+        return text, end
+
+    @staticmethod
+    def parse_object_info(data: bytes) -> ObjectInfo | None:
+        """Decode the 0x9170 file record (size, format, name, timestamps)."""
+        if len(data) < 0x39:
+            return None
+        try:
+            size = struct.unpack_from("<I", data, 8)[0]
+            obj_format = struct.unpack_from("<I", data, 4)[0]
+            name, pos = PTPIPClient._read_p16(data, 0x38)
+            time1 = time2 = ""
+            if pos < len(data):
+                time1, pos = PTPIPClient._read_p16(data, pos)
+            if pos < len(data):
+                time2, pos = PTPIPClient._read_p16(data, pos)
+        except (ValueError, struct.error):
+            return None
+        return ObjectInfo(
+            size=size,
+            format=obj_format,
+            filename=name,
+            time1=time1,
+            time2=time2,
+        )
 
     def get_object_info(self, handle: int):
         return self.op(0x9170, (handle,))

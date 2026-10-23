@@ -367,7 +367,7 @@ Object notification (`kind = 0xC1AB`) body:
 
 ```
 +0   uint32 handle          e.g. 0x91903B82
-+4   uint32 0x00003801      (observed constant/flags)
++4   uint32 format          e.g. 0x00003801 (JPEG)
 +8   uint32 0x00000020      (observed)
 +12  uint32 size            total object size in bytes
 +16  uint32 0x00000000
@@ -398,10 +398,39 @@ Additional standard PTP properties used by the reference implementation:
 
 ### 5.4 Object info (`0x9170`)
 
-Returns 150 bytes for a storage/root handle and 158 bytes for a file handle. It contains
-UTF‑16 folder names (`100CANON`) and timestamps (`20211008T185511.0`). The exact layout is
-not needed: the **path and size come from the `0xC1AB` event**, so the implementation can
-treat `0x9170` as an optional info step.
+Returns 150 bytes for a storage/root handle and 158 bytes for a file handle. The layout
+observed for files:
+
+```
++0      uint32 storage id       e.g. 0x00020001
++4      uint32 object format    e.g. 0x00003801 (JPEG)
++8      uint32 object size      bytes
++0x38   uint8  filename length  in UTF-16 code units, including the NUL
++0x39   char[] filename         UTF-16LE, NUL-terminated, e.g. "IMG_0952.JPG"
+        uint8  timestamp length
+        char[] timestamp        UTF-16LE, e.g. "20260126T214631.0"
+        uint8  timestamp length
+        char[] timestamp        UTF-16LE, e.g. "20260126T214630.0"
+```
+
+The two timestamps are camera-side wall-clock times with one-second resolution (one is
+normally the capture time and the other the file write/modification time; their order is
+not guaranteed). They are close to, but not always identical to, EXIF
+`DateTimeOriginal`.
+
+No checksum, EXIF block, or other content hash is exposed by this record. Before a
+download, the available identity fields are:
+
+- camera path and filename (from `0xC1AB`, or the filename here);
+- object size and format (here and in `0xC1AB`);
+- the two camera timestamps (here);
+- the camera-assigned handle (session-local; do not treat it as a permanent ID).
+
+A client that needs to distinguish a new photo from an old one with the same filename
+should use `(path, size, format, timestamp1, timestamp2)`, not the filename or handle
+alone.
+Content identity can only be obtained by reading object bytes (for example a small
+prefix via `0x9174`, or a thumbnail); the full SHA-256 is best computed after download.
 
 ### 5.5 Object read (`0x9174`)
 

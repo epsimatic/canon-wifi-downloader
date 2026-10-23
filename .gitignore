@@ -1,5 +1,7 @@
 ### ITU2 emulator runtime/test data (may contain host identity)
 state.json
+history.json
+history.json.*
 
 downloads/
 recon/
