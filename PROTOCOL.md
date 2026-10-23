@@ -447,6 +447,14 @@ Observed for a 3,832,873-byte object:
 `0x200000` (2 MB) is a safe chunk size. Use `remaining` (params[1]) or the event size to
 drive the loop.
 
+On the test EOS 250D, the camera appears to stage a 2 MB window: while that window is
+being consumed, `remaining` stays around `0x200000`, and after it is exhausted the value
+drops to the object remainder. Smaller requests (for example 512 KB) do not shorten the
+initial wait; they only add `0x9102`/`0x91E9` round trips. Live throughput varied from
+roughly 25 to 120 KB/s and was dominated by the camera/Wi‑Fi link, not by the Python
+client. Keep the default 2 MB chunk unless measurements on a different body show
+otherwise.
+
 ---
 
 ## 6. End-to-end sequences

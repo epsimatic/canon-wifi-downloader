@@ -42,6 +42,9 @@ OUT_DIR = "downloads"
 HISTORY: DownloadHistory | None = None
 REDOWNLOAD_MISSING = False
 FLAT = False
+CAPTURE_DIR: str | None = None
+CHUNK_SIZE = 0x200000
+RCVBUF = 0
 
 
 _UNSAFE_CHARS = set("/\\:*?\"<>|'")
@@ -122,7 +125,14 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
     log = lambda *a: print(f"[{time.strftime('%H:%M:%S')}][{ip}]", *a, flush=True)
     cli = None
     try:
-        cli = PTPIPClient(ip, guid, pc_name, log=log, save_dir="recon/captures/live")
+        cli = PTPIPClient(
+            ip,
+            guid,
+            pc_name,
+            log=log,
+            save_dir=CAPTURE_DIR,
+            rcvbuf=RCVBUF,
+        )
         cli.connect()
         setup = cli.start_session()
         if mode == "Pairing":
@@ -184,7 +194,12 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                         log(f"  already downloaded; skipping ({saved})")
                         continue
 
-                buf = cli.read_object(rec.handle, size)
+                buf = cli.read_object(
+                    rec.handle,
+                    size,
+                    chunk=CHUNK_SIZE,
+                    storage_id=info.storage_id if info else 0x00020001,
+                )
                 if len(buf) != size:
                     log(
                         f"  unexpected object length: got {len(buf)} of {size} bytes; "
@@ -247,7 +262,7 @@ def on_camera(d: dict, guid: str, pc_name: str):
 
 
 def main():
-    global OUT_DIR, HISTORY, REDOWNLOAD_MISSING, FLAT
+    global OUT_DIR, HISTORY, REDOWNLOAD_MISSING, FLAT, CAPTURE_DIR, CHUNK_SIZE, RCVBUF
     ap = argparse.ArgumentParser()
     ap.add_argument("--iface-ip", default=None)
     ap.add_argument("--http-port", type=int, default=2869)
@@ -270,10 +285,34 @@ def main():
         action="store_true",
         help="save as <out>/<filename> instead of <out>/<camera>/<folder>/<filename>",
     )
+    ap.add_argument(
+        "--chunk-size",
+        type=int,
+        default=0x200000,
+        help="object read chunk size in bytes (default: 2097152)",
+    )
+    ap.add_argument(
+        "--capture",
+        default=None,
+        help="save raw operation payloads to this directory (debug, slow)",
+    )
+    ap.add_argument(
+        "--rcvbuf",
+        type=int,
+        default=0,
+        help="socket receive buffer in bytes; 0 uses the OS default",
+    )
     args = ap.parse_args()
+    if args.chunk_size <= 0:
+        ap.error("--chunk-size must be positive")
+    if args.rcvbuf < 0:
+        ap.error("--rcvbuf must be zero or positive")
     OUT_DIR = args.out
     REDOWNLOAD_MISSING = args.redownload_missing
     FLAT = args.flat
+    CAPTURE_DIR = args.capture
+    CHUNK_SIZE = args.chunk_size
+    RCVBUF = args.rcvbuf
     HISTORY = DownloadHistory(args.history)
     state = load_state()
     guid, pc_name = get_identity(state)
