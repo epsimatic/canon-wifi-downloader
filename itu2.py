@@ -18,7 +18,6 @@ import datetime
 import hashlib
 import os
 import posixpath
-import re
 import sys
 import threading
 import time
@@ -45,14 +44,40 @@ REDOWNLOAD_MISSING = False
 FLAT = False
 
 
+_UNSAFE_CHARS = set("/\\:*?\"<>|'")
+_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CLOCK$",
+    "CONIN$",
+    "CONOUT$",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def _safe_component(name: str, fallback: str) -> str:
-    """Make one path component safe on Linux/macOS and Windows."""
-    name = (name or "").strip()
-    name = name.replace("/", "_").replace("\\", "_")
-    name = re.sub(r'[\x00-\x1f<>:"|?*]', "_", name)
-    name = name.strip(" .")
+    """Make one path component safe on Linux/macOS and Windows.
+
+    Separators, quotes, colon and other Windows-reserved characters are
+    replaced with ``_``. Every non-printable code point is also replaced with
+    ``_``. Names that reduce to empty, ``.`` or ``..`` use the fallback, and
+    Windows device names (CON, NUL, COM1, ...) are prefixed with ``_``.
+    """
+    cleaned = []
+    for ch in name or "":
+        if ch in _UNSAFE_CHARS or not ch.isprintable():
+            cleaned.append("_")
+        else:
+            cleaned.append(ch)
+    name = "".join(cleaned).strip(" .")
     if name in ("", ".", ".."):
         return fallback
+    stem = name.split(".", 1)[0].upper()
+    if stem in _RESERVED_NAMES:
+        name = f"_{name}"
     return name
 
 
