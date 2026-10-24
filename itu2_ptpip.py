@@ -126,11 +126,13 @@ class PTPIPClient:
         timeout: float = 180.0,
         save_dir: str | None = None,
         rcvbuf: int = 0,
+        debug_log=None,
     ):
         self.ip = ip
         self.guid = bytes.fromhex(guid_hex.replace("-", ""))
         self.name = name
         self.log = log
+        self.debug_log = debug_log
         self.timeout = timeout
         self.save_dir = save_dir
         self.rcvbuf = rcvbuf
@@ -147,6 +149,11 @@ class PTPIPClient:
         # Experimental: the official capture emits a 0x9173 completion sequence
         # after each object. Our basic 0x91F0/0x91E9/0x9177 tail works without it.
         self.use_9173 = False
+
+    def dbg(self, *a):
+        """Protocol-level trace, shown only with --debug."""
+        if self.debug_log:
+            self.debug_log(*a)
 
     # ---------- low-level ----------
     def _recv_exact(self, sock: socket.socket, n: int) -> bytes:
@@ -247,17 +254,17 @@ class PTPIPClient:
 
     # ---------- session ----------
     def connect(self):
-        self.log(f"PTP/IP connecting to {self.ip}:15740")
+        self.dbg(f"PTP/IP connecting to {self.ip}:15740")
         self.cmd = self._connect_tcp()
         body = (
             self.guid
             + (self.name + "\x00").encode("utf-16le")
             + struct.pack("<I", 0x00010000)
         )
-        self.log(f"-> InitCmdReq guid={self.guid.hex()} name={self.name!r}")
+        self.dbg(f"-> InitCmdReq guid={self.guid.hex()} name={self.name!r}")
         self.cmd.sendall(_pkt(T_INIT_CMD_REQ, body))
         typ, b = self._recv_pkt(self.cmd)
-        self.log(f"<- {TYPE_NAME.get(typ, typ)} {self._describe(typ, b)}")
+        self.dbg(f"<- {TYPE_NAME.get(typ, typ)} {self._describe(typ, b)}")
         if typ == T_INIT_FAIL:
             raise PTPIPError(f"camera refused connection (InitFail {b.hex()})")
         if typ != T_INIT_CMD_ACK:
@@ -274,7 +281,7 @@ class PTPIPClient:
         self.event.settimeout(1.0)
         self.event.sendall(_pkt(T_INIT_EVENT_REQ, struct.pack("<I", self.conn_number)))
         typ, b = self._recv_pkt(self.event)
-        self.log(f"<- (event) {TYPE_NAME.get(typ, typ)} {self._describe(typ, b)}")
+        self.dbg(f"<- (event) {TYPE_NAME.get(typ, typ)} {self._describe(typ, b)}")
         self._event_thread = threading.Thread(target=self._event_loop, daemon=True)
         self._event_thread.start()
         return self
@@ -287,7 +294,7 @@ class PTPIPClient:
                 continue
             except Exception:
                 break
-            self.log(f"<- EVENT {TYPE_NAME.get(typ, typ)} {self._describe(typ, body)}")
+            self.dbg(f"<- EVENT {TYPE_NAME.get(typ, typ)} {self._describe(typ, body)}")
             if typ == T_EVENT:
                 try:
                     ev, tid = struct.unpack_from("<HI", body, 0)
@@ -342,7 +349,7 @@ class PTPIPClient:
                     pending = (typ, body)
                     break
                 if typ not in (T_DATA, T_END_DATA):
-                    self.log(
+                    self.dbg(
                         f"<- (data phase) {TYPE_NAME.get(typ, typ)} "
                         f"{self._describe(typ, body)}"
                     )
@@ -354,7 +361,7 @@ class PTPIPClient:
         body = struct.pack("<IHI", dp, code, tid) + b"".join(
             struct.pack("<I", p) for p in params
         )
-        self.log(f"-> OpReq 0x{code:04X} tid={tid} params={[hex(p) for p in params]}")
+        self.dbg(f"-> OpReq 0x{code:04X} tid={tid} params={[hex(p) for p in params]}")
         self.cmd.sendall(_pkt(T_OP_REQ, body))
         data = b""
         pending = None
@@ -365,13 +372,13 @@ class PTPIPClient:
             else:
                 typ, b = self._recv_pkt(self.cmd)
             if typ not in (T_DATA, T_END_DATA, T_CANCEL):
-                self.log(f"<- {TYPE_NAME.get(typ, typ)} {self._describe(typ, b)}")
+                self.dbg(f"<- {TYPE_NAME.get(typ, typ)} {self._describe(typ, b)}")
             if typ == T_START_DATA:
                 total = struct.unpack_from("<Q", b, 4)[0]
                 dtid = struct.unpack_from("<I", b, 0)[0]
                 data, packets, elapsed, pending = self._read_data_phase(total, dtid)
                 rate = len(data) / elapsed / 1024 if elapsed > 0 else 0.0
-                self.log(
+                self.dbg(
                     f"<- data {len(data)} bytes in {packets} packets, "
                     f"{elapsed:.1f}s ({rate:.0f} KB/s)"
                 )
@@ -389,7 +396,7 @@ class PTPIPClient:
                         with open(fn, "wb") as f:
                             f.write(data)
                     except Exception as e:
-                        self.log(f"  (save failed: {e})")
+                        self.dbg(f"  (save failed: {e})")
                 if rtid == tid or True:
                     return rc, ps, data
             # ignore other packets (events arriving on cmd channel etc.)
@@ -608,7 +615,7 @@ class PTPIPClient:
             buf[offset : offset + take] = data[:take]
             offset += take
             rate = take / elapsed / 1024 if elapsed > 0 else 0.0
-            self.log(
+            self.dbg(
                 f"   0x9174 offset={offset - take} got={take} "
                 f"in {elapsed:.1f}s ({rate:.0f} KB/s)"
             )

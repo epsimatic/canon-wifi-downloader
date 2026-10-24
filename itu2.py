@@ -7,7 +7,7 @@ Advertises the Computer device, and when the camera appears:
   * transfer mode -> downloads every object the camera announces
 
 Usage:
-    python3 itu2.py [--iface-ip 192.0.2.10] [--http-port 2869]
+    python3 itu2.py [--iface-ip 192.0.2.10] [--http-port 2869] [--debug]
                     [-d downloads | -i http://immich.local:2283]
                     [--immich-key KEY | IMMICH_API_KEY=KEY] [--immich-album NAME]
                     [--flat]
@@ -53,6 +53,7 @@ RCVBUF = 0
 MODE = "dir"  # "dir" or "immich"
 IMMICH: ImmichClient | None = None
 IMMICH_ALBUM: str | None = None
+DEBUG = False
 
 
 _UNSAFE_CHARS = set("/\\:*?\"<>|'")
@@ -191,8 +192,22 @@ def _forget_immich_key(state: dict) -> bool:
     return True
 
 
+def _line(ip: str, *a):
+    print(f"[{time.strftime('%H:%M:%S')}][{ip}]", *a, flush=True)
+
+
+def _debug_line(ip: str, *a):
+    if DEBUG:
+        print(f"[{time.strftime('%H:%M:%S')}][{ip}]", *a, flush=True)
+
+
 def session(ip: str, guid: str, pc_name: str, mode: str):
-    log = lambda *a: print(f"[{time.strftime('%H:%M:%S')}][{ip}]", *a, flush=True)
+    def log(*a):
+        _line(ip, *a)
+
+    def dbg(*a):
+        _debug_line(ip, *a)
+
     cli = None
     try:
         cli = PTPIPClient(
@@ -200,6 +215,7 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
             guid,
             pc_name,
             log=log,
+            debug_log=dbg,
             save_dir=CAPTURE_DIR,
             rcvbuf=RCVBUF,
         )
@@ -233,14 +249,14 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                 _rc, _ps, info_data = cli.get_object_info(rec.handle)
                 info = cli.parse_object_info(info_data) if info_data else None
                 if info is None:
-                    log(
+                    dbg(
                         f"object 0x{rec.handle:08X}: no parsable 0x9170 info; "
                         "dedupe disabled for this object"
                     )
                 path = rec.path or (info.filename if info else "")
                 size = rec.size or (info.size if info else 0)
                 if info and rec.size and info.size != rec.size:
-                    log(
+                    dbg(
                         f"object 0x{rec.handle:08X}: size mismatch "
                         f"(event={rec.size}, info={info.size}); using event size"
                     )
@@ -252,7 +268,7 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                     time2=info.time2 if info else "",
                     handle=rec.handle,
                 )
-                log(
+                dbg(
                     f"object 0x{rec.handle:08X} size={size} path={path!r} "
                     f"time={meta.time1 or '?'}/{meta.time2 or '?'}"
                 )
@@ -267,12 +283,12 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                         if REDOWNLOAD_MISSING and not os.path.exists(saved):
                             log(f"  local file missing; re-downloading ({saved})")
                         else:
-                            log(f"  already downloaded; skipping ({saved})")
+                            dbg(f"  already downloaded; skipping ({saved})")
                             continue
                 else:
                     remote = ((entry or {}).get("immich") or {}).get(IMMICH.url)
                     if remote:
-                        log(
+                        dbg(
                             "  already uploaded; skipping "
                             f"(asset {remote.get('asset_id', '?')})"
                         )
@@ -306,10 +322,8 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                     _set_mtime(fn, meta.time2 or meta.time1)
                     if HISTORY:
                         HISTORY.add(camera_id, camera_label, meta, fn, sha, head_sha)
-                    log(
-                        f"  saved {fn} ({len(buf)} bytes) "
-                        f"sha256={sha} head_sha256={head_sha}"
-                    )
+                    log(f"  saved {fn} ({len(buf)} bytes)")
+                    dbg(f"  sha256={sha} head_sha256={head_sha}")
                     continue
 
                 filename = _upload_filename(path, rec.handle)
@@ -345,8 +359,9 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                     )
                 log(
                     f"  uploaded {filename} ({len(buf)} bytes) -> asset {asset_id} "
-                    f"({result['status']}) sha256={sha}"
+                    f"({result['status']})"
                 )
+                dbg(f"  sha256={sha}")
                 if IMMICH_ALBUM:
                     try:
                         album_id = IMMICH.ensure_album(IMMICH_ALBUM)
@@ -359,7 +374,7 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
         for _ in range(60):
             process(cli.get_event())
             time.sleep(2)
-        log("transfer tail")
+        dbg("transfer tail")
         cli.finish_pairing()
     except Exception as e:
         log(f"session error: {type(e).__name__}: {e}")
@@ -392,7 +407,7 @@ def on_camera(d: dict, guid: str, pc_name: str):
 
 def main():
     global OUT_DIR, HISTORY, REDOWNLOAD_MISSING, FLAT, CAPTURE_DIR, CHUNK_SIZE, RCVBUF
-    global MODE, IMMICH, IMMICH_ALBUM
+    global MODE, IMMICH, IMMICH_ALBUM, DEBUG
     ap = argparse.ArgumentParser(
         epilog=(
             "Immich API key permissions: asset.upload (uploads); album.read, "
@@ -402,6 +417,11 @@ def main():
     )
     ap.add_argument("--iface-ip", default=None)
     ap.add_argument("--http-port", type=int, default=2869)
+    ap.add_argument(
+        "--debug",
+        action="store_true",
+        help="show verbose protocol tracing (SSDP, PTP/IP packets, chunk reads)",
+    )
     destination = ap.add_mutually_exclusive_group()
     destination.add_argument(
         "-d",
@@ -482,6 +502,7 @@ def main():
         help="socket receive buffer in bytes; 0 uses the OS default",
     )
     args = ap.parse_args()
+    DEBUG = args.debug
     if args.chunk_size <= 0:
         ap.error("--chunk-size must be positive")
     if args.rcvbuf < 0:
@@ -576,7 +597,7 @@ def main():
         f"identity: guid={guid} pc_name={pc_name} iface_ip={iface_ip} "
         f"{dest} history={args.history}"
     )
-    disc = Discovery(iface_ip, guid, pc_name, args.http_port)
+    disc = Discovery(iface_ip, guid, pc_name, args.http_port, debug=args.debug)
     disc.camera_ip = args.camera_ip
     disc.on_camera = lambda d: on_camera(d, guid, pc_name)
     disc.run()

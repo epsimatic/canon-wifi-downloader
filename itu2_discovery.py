@@ -152,7 +152,7 @@ SCPD = (
 class HTTPHandler(BaseHTTPRequestHandler):
     guid = ""
     pc_name = ""
-    log = None
+    debug = None
 
     def log_message(self, *a):  # silence default logging
         pass
@@ -174,15 +174,21 @@ class HTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
-        if self.log:
-            self.log(
+        if self.debug:
+            self.debug(
                 f"HTTP GET {self.path} from {self.client_address[0]} -> 200 ({len(body)} bytes)"
             )
 
 
 class Discovery:
     def __init__(
-        self, iface_ip: str, guid: str, pc_name: str, http_port: int, verbose=True
+        self,
+        iface_ip: str,
+        guid: str,
+        pc_name: str,
+        http_port: int,
+        verbose=True,
+        debug=False,
     ):
         self.iface_ip = iface_ip
         self.guid = guid.upper()
@@ -190,6 +196,7 @@ class Discovery:
         self.http_port = http_port
         self.location = f"http://{iface_ip}:{http_port}/desc.xml"
         self.verbose = verbose
+        self.debug = debug
         self.bootid = int(time.time()) & 0x7FFFFFFF
         self._stop = threading.Event()
         self.seen_cameras: dict[str, dict] = {}
@@ -198,22 +205,27 @@ class Discovery:
         self.on_camera = None
         self.camera_ip: str | None = None
         self._last_fetch: dict[str, float] = {}
+        self._last_summary: dict[str, str] = {}
 
     def log(self, *a):
         if self.verbose:
+            print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+
+    def dbg(self, *a):
+        """Protocol-level trace, shown only with --debug."""
+        if self.verbose and self.debug:
             print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
     # ---- HTTP description server ----
     def start_http(self):
         HTTPHandler.guid = self.guid
         HTTPHandler.pc_name = self.pc_name
-        HTTPHandler.log = self.log
+        HTTPHandler.debug = self.dbg
         srv = ThreadingHTTPServer(("0.0.0.0", self.http_port), HTTPHandler)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
-        self.log(
-            f"HTTP description server on :{self.http_port} (LOCATION {self.location})"
-        )
+        self.log(f"HTTP description server on :{self.http_port}")
+        self.dbg(f"  LOCATION {self.location}")
         return srv
 
     # ---- SSDP advertise ----
@@ -258,7 +270,7 @@ class Discovery:
             for nt, usn in self._notify_targets():
                 self._send_notify(sock, nt, usn)
             if first:
-                self.log(f"advertised as uuid:{self.guid} name={self.pc_name}")
+                self.dbg(f"advertised as uuid:{self.guid} name={self.pc_name}")
                 first = False
             self._stop.wait(15)
         # byebye on shutdown
@@ -300,7 +312,7 @@ class Discovery:
             for line in text.split("\r\n"):
                 if line.lower().startswith("st:"):
                     st = line[3:].strip()
-            self.log(f"M-SEARCH from {addr[0]} ST={st}")
+            self.dbg(f"M-SEARCH from {addr[0]} ST={st}")
             targets = {
                 DEVICE_TYPE,
                 SERVICE_TYPE,
@@ -379,7 +391,7 @@ class Discovery:
         if time.time() - self._last_fetch.get(src, 0.0) < 2.0:
             return
         self._last_fetch[src] = time.time()
-        self.log(f"Canon SSDP from {src}: USN={usn} LOCATION={location}")
+        self.dbg(f"Canon SSDP from {src}: USN={usn} LOCATION={location}")
         self.fetch_description(src, location)
 
     def fetch_description(self, src: str, location: str):
@@ -387,7 +399,7 @@ class Discovery:
             with urllib.request.urlopen(location, timeout=5) as r:
                 body = r.read().decode("utf-8", "replace")
         except Exception as e:
-            self.log(f"  (failed to fetch description: {e})")
+            self.dbg(f"  (failed to fetch description: {e})")
             return
 
         def field(name):
@@ -421,10 +433,18 @@ class Discovery:
             "?",
         )
         label = "camera" if is_camera else "peer host"
-        self.log(
+        state = "paired to us" if paired else "not paired to us"
+        if is_camera:
+            summary = (
+                f"camera {d['ip']} name={d['friendlyName']!r} mode={mode} ({state})"
+            )
+            if self._last_summary.get(src) != summary:
+                self._last_summary[src] = summary
+                self.log(f"  {summary}")
+        self.dbg(
             f"  {label} {d['ip']} name={d['friendlyName']!r} serial={d['serialNumber']} "
             f"nick={d['nickname']!r} mode={mode} targetId={d['targetId']!r} "
-            f"-> {'PAIRED TO US' if paired else 'not paired to us'}"
+            f"-> {state.upper()}"
         )
         d["paired"] = paired
         d["mode"] = mode
@@ -479,13 +499,16 @@ def main():
         "--iface-ip", default=None, help="local IP to advertise (default: auto)"
     )
     ap.add_argument("--http-port", type=int, default=2869)
+    ap.add_argument(
+        "--debug", action="store_true", help="show verbose protocol tracing"
+    )
     args = ap.parse_args()
     state = load_state()
     guid, pc_name = get_identity(state)
     iface_ip = args.iface_ip or guess_iface_ip()
     print(f"identity: guid={guid} pc_name={pc_name}")
     print(f"iface_ip: {iface_ip}")
-    d = Discovery(iface_ip, guid, pc_name, args.http_port)
+    d = Discovery(iface_ip, guid, pc_name, args.http_port, debug=args.debug)
     d.run()
 
 
