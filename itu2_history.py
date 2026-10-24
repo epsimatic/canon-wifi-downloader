@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Persistent download history for the ITU2 emulator.
+Persistent download/upload history for the ITU2 emulator.
 
 The camera does not expose a content checksum. What it does expose before a
 download (via the 0xC1AB event and the 0x9170 info record) is enough to identify
@@ -9,7 +9,9 @@ timestamps with one-second resolution. A new photo that reuses an old filename
 will normally differ in at least one of those fields.
 
 Entries are additionally keyed by the camera GUID so that two cameras with the
-same folder/filename scheme do not share history.
+same folder/filename scheme do not share history. Each object can record a
+local path (``--dir``) and one or more Immich uploads (``--immich``), so switching
+destinations only transfers what that destination is still missing.
 """
 
 from __future__ import annotations
@@ -92,6 +94,21 @@ class DownloadHistory:
                 return None
             return camera.get("objects", {}).get(object_key(meta))
 
+    @staticmethod
+    def _object_fields(meta: ObjectMeta) -> dict:
+        return {
+            "path": meta.path,
+            "size": meta.size,
+            "format": meta.format,
+            "handle": f"0x{meta.handle:08X}",
+            "time1": meta.time1,
+            "time2": meta.time2,
+        }
+
+    def _entry(self, camera_id: str, camera_name: str, meta: ObjectMeta) -> dict:
+        camera = self._camera(camera_id, camera_name)
+        return camera["objects"].setdefault(object_key(meta), self._object_fields(meta))
+
     def add(
         self,
         camera_id: str,
@@ -101,22 +118,54 @@ class DownloadHistory:
         sha256: str,
         head_sha256: str = "",
     ) -> None:
+        """Record a local file, preserving any Immich uploads already recorded."""
         if not meta.time1 and not meta.time2:
             self.log(f"history: not recording {meta.path!r} (no camera timestamps)")
             return
         with self._lock:
-            camera = self._camera(camera_id, camera_name)
-            camera["objects"][object_key(meta)] = {
-                "path": meta.path,
-                "size": meta.size,
-                "format": meta.format,
-                "handle": f"0x{meta.handle:08X}",
-                "time1": meta.time1,
-                "time2": meta.time2,
-                "sha256": sha256,
-                "head_sha256": head_sha256,
-                "saved_as": os.path.abspath(saved_as),
-                "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            entry = self._entry(camera_id, camera_name, meta)
+            entry.update(self._object_fields(meta))
+            entry.update(
+                {
+                    "sha256": sha256,
+                    "head_sha256": head_sha256,
+                    "saved_as": os.path.abspath(saved_as),
+                    "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+            )
+            try:
+                self._save()
+            except OSError as e:
+                self.log(f"history: failed to save {self.path}: {e}")
+
+    def add_immich(
+        self,
+        camera_id: str,
+        camera_name: str,
+        meta: ObjectMeta,
+        url: str,
+        asset_id: str,
+        status: str,
+        sha256: str,
+        head_sha256: str = "",
+    ) -> None:
+        """Record a successful upload, keeping any local copy entry intact.
+
+        Uploads are keyed by normalized Immich base URL so switching between
+        instances does not incorrectly skip objects.
+        """
+        if not meta.time1 and not meta.time2:
+            self.log(f"history: not recording {meta.path!r} (no camera timestamps)")
+            return
+        with self._lock:
+            entry = self._entry(camera_id, camera_name, meta)
+            entry.update(self._object_fields(meta))
+            entry["sha256"] = sha256
+            entry["head_sha256"] = head_sha256
+            entry.setdefault("immich", {})[url] = {
+                "asset_id": asset_id,
+                "status": status,
+                "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             }
             try:
                 self._save()

@@ -10,20 +10,33 @@ This is very much a PoC / work in progress right now. Expect only the basic down
 
 ### Usage instructions:
 
-1. Run the pairing script:   
+1. Start the script (see **Destinations** below for where files go):   
   ```bash
-  python3 itu2.py
+  python3 itu2.py                      # save to ./downloads
+  python3 itu2.py -d ~/Pictures/camera # save to a specific directory
+  python3 itu2.py -i http://immich.local:2283 --immich-key KEY  # upload to Immich
   ```
-2. In Canon camera, enter **Wireless settings** → **Wi-Fi settings: Enable** → **Auto send images to computer** → **Auto send: Enable** → **OK**
-3. Connect to your Wi-Fi → **IP address set: Auto** → **OK**
+2. In Canon camera, enter **Wireless settings** → **Wi-Fi settings: Enable** → **Auto send images to computer** → **Auto send: Enable** → **OK**
+3. Connect to your Wi-Fi → **IP address set: Auto** → **OK**
 4. You should see `Downloader XXXX` in the list. Select it to connect. It'll show "Confirm in Canon app" shortly, then **Settings complete**.
 5. **Reboot the camera.** It only starts transferring photos after a reboot.
-6. Camera would blink the wireless icon on status screen. And your photos would slowly start appearing under `downloads/<camera>/<camera folder>/`
+6. Camera would blink the wireless icon on status screen. And your photos would slowly start appearing in your chosen destination.
 
 If camera shows a "🛜OFF" icon, try restarting the camera. It only enters image transfer mode for a short time after a start-up.   
 If that fails too, un-pair the camera (from the camera menu), delete `state.json` and start again.
 
-### Folder layout
+Run with `--help` for all options.
+
+### Destinations
+
+Exactly one destination is used per run:
+
+| Option | Destination |
+|---|---|
+| `-d DIR`, `--dir DIR` | Write files under `DIR`. Default: `downloads`. |
+| `-i URL`, `--immich URL` | Upload each new photo/video to an Immich instance. |
+
+#### Saving to a directory
 
 By default, files are grouped by camera and by the camera's own folder:
 
@@ -36,7 +49,22 @@ downloads/
       IMG_2000.JPG
 ```
 
-Use `--flat` to write only the camera filename into the output directory. Run with `--help` for more options.
+Use `--flat` to write only the camera filename into the output directory. `--redownload-missing` re-fetches entries whose local file was deleted.
+
+#### Uploading to Immich
+
+Create an API key in Immich (**Account/User Settings → API Keys → New API Key**) and grant these permissions:
+
+- `asset.upload`
+- `album.read`
+- `album.create`
+- `albumAsset.create`
+- `asset.share`
+- `user.read`
+
+`asset.upload` alone is enough if you do not use `--immich-album`. The easiest option in the Immich UI is to select all permissions.
+
+Then pass the key with `--immich-key`, or export `IMMICH_API_KEY`. Use `--immich-key KEY --immich-save-key` to store key in settings.
 
 ### Protocol docs:
 

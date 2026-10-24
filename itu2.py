@@ -7,7 +7,9 @@ Advertises the Computer device, and when the camera appears:
   * transfer mode -> downloads every object the camera announces
 
 Usage:
-    python3 itu2.py [--iface-ip 192.0.2.10] [--http-port 2869] [--out downloads]
+    python3 itu2.py [--iface-ip 192.0.2.10] [--http-port 2869]
+                    [-d downloads | -i http://immich.local:2283]
+                    [--immich-key KEY | IMMICH_API_KEY=KEY] [--immich-album NAME]
                     [--flat]
 """
 
@@ -25,12 +27,15 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from itu2_discovery import (
+    STATE_PATH,
     Discovery,
-    guess_iface_ip,
     get_identity,
+    guess_iface_ip,
     load_state,
+    save_state,
 )  # noqa: E402
 from itu2_history import DownloadHistory, ObjectMeta  # noqa: E402
+from itu2_immich import ImmichClient, ImmichError  # noqa: E402
 from itu2_ptpip import PTPIPClient  # noqa: E402
 
 _lock = threading.Lock()
@@ -45,6 +50,9 @@ FLAT = False
 CAPTURE_DIR: str | None = None
 CHUNK_SIZE = 0x200000
 RCVBUF = 0
+MODE = "dir"  # "dir" or "immich"
+IMMICH: ImmichClient | None = None
+IMMICH_ALBUM: str | None = None
 
 
 _UNSAFE_CHARS = set("/\\:*?\"<>|'")
@@ -121,6 +129,68 @@ def _set_mtime(path: str, stamp: str) -> None:
         pass
 
 
+def _upload_filename(camera_path: str, handle: int) -> str:
+    """Original camera filename, safe as a multipart parameter value."""
+    name = posixpath.basename((camera_path or "").rstrip("/"))
+    name = "".join("_" if not ch.isprintable() else ch for ch in name)
+    if name in ("", ".", ".."):
+        return f"0x{handle:08X}.bin"
+    return name
+
+
+def _iso_camera_time(stamp: str) -> str | None:
+    """Convert ``YYYYMMDDTHHMMSS.fff`` camera wall time to local ISO 8601."""
+    if not stamp:
+        return None
+    for fmt in ("%Y%m%dT%H%M%S.%f", "%Y%m%dT%H%M%S"):
+        try:
+            dt = datetime.datetime.strptime(stamp, fmt)
+        except ValueError:
+            continue
+        # The camera clock is local wall time; attach this computer's offset.
+        return dt.astimezone().isoformat(timespec="milliseconds")
+    return None
+
+
+def _upload_timestamps(meta: ObjectMeta) -> tuple[str, str]:
+    iso = _iso_camera_time(meta.time2 or meta.time1)
+    if iso is None:
+        iso = datetime.datetime.now().astimezone().isoformat(timespec="milliseconds")
+    return iso, iso
+
+
+def _saved_immich_key(state: dict) -> str:
+    """Return the Immich API key stored in state.json, if any."""
+    immich = state.get("immich")
+    if isinstance(immich, dict):
+        key = immich.get("api_key")
+        if isinstance(key, str):
+            return key.strip()
+    return ""
+
+
+def _store_immich_key(state: dict, key: str) -> None:
+    """Persist an Immich API key in state.json (written with mode 0600)."""
+    immich = state.get("immich")
+    if not isinstance(immich, dict):
+        immich = {}
+        state["immich"] = immich
+    immich["api_key"] = key
+    save_state(state)
+
+
+def _forget_immich_key(state: dict) -> bool:
+    """Remove the saved Immich API key; return whether one was present."""
+    immich = state.get("immich")
+    if not isinstance(immich, dict) or "api_key" not in immich:
+        return False
+    del immich["api_key"]
+    if not immich:
+        state.pop("immich", None)
+    save_state(state)
+    return True
+
+
 def session(ip: str, guid: str, pc_name: str, mode: str):
     log = lambda *a: print(f"[{time.strftime('%H:%M:%S')}][{ip}]", *a, flush=True)
     cli = None
@@ -141,7 +211,12 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
             log("pairing done")
             return
         # Transfer
-        os.makedirs(OUT_DIR, exist_ok=True)
+        if MODE == "immich" and IMMICH is None:
+            raise RuntimeError(
+                "Immich destination selected but no client is configured"
+            )
+        if MODE == "dir":
+            os.makedirs(OUT_DIR, exist_ok=True)
         log("transfer mode: processing events + polling…")
         done: set[int] = set()
         camera_id = cli.camera_guid or cli.camera_name or ip
@@ -186,12 +261,21 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                     continue
 
                 entry = HISTORY.lookup(camera_id, meta) if HISTORY else None
-                if entry:
-                    saved = entry.get("saved_as", "")
-                    if REDOWNLOAD_MISSING and not os.path.exists(saved):
-                        log(f"  local file missing; re-downloading ({saved})")
-                    else:
-                        log(f"  already downloaded; skipping ({saved})")
+                if MODE == "dir":
+                    saved = (entry or {}).get("saved_as", "")
+                    if saved:
+                        if REDOWNLOAD_MISSING and not os.path.exists(saved):
+                            log(f"  local file missing; re-downloading ({saved})")
+                        else:
+                            log(f"  already downloaded; skipping ({saved})")
+                            continue
+                else:
+                    remote = ((entry or {}).get("immich") or {}).get(IMMICH.url)
+                    if remote:
+                        log(
+                            "  already uploaded; skipping "
+                            f"(asset {remote.get('asset_id', '?')})"
+                        )
                         continue
 
                 buf = cli.read_object(
@@ -206,24 +290,69 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                         "not recording in history"
                     )
                     continue
-                with _output_lock:
-                    fn = _unique_path(_output_path(camera_label, path, rec.handle))
-                    os.makedirs(os.path.dirname(fn), exist_ok=True)
-                    tmp = fn + ".part"
-                    with open(tmp, "wb") as f:
-                        f.write(buf)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp, fn)
-                _set_mtime(fn, meta.time2 or meta.time1)
                 sha = hashlib.sha256(buf).hexdigest()
                 head_sha = hashlib.sha256(buf[:65536]).hexdigest()
+
+                if MODE == "dir":
+                    with _output_lock:
+                        fn = _unique_path(_output_path(camera_label, path, rec.handle))
+                        os.makedirs(os.path.dirname(fn), exist_ok=True)
+                        tmp = fn + ".part"
+                        with open(tmp, "wb") as f:
+                            f.write(buf)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp, fn)
+                    _set_mtime(fn, meta.time2 or meta.time1)
+                    if HISTORY:
+                        HISTORY.add(camera_id, camera_label, meta, fn, sha, head_sha)
+                    log(
+                        f"  saved {fn} ({len(buf)} bytes) "
+                        f"sha256={sha} head_sha256={head_sha}"
+                    )
+                    continue
+
+                filename = _upload_filename(path, rec.handle)
+                created, modified = _upload_timestamps(meta)
+                log(f"  uploading {filename} ({len(buf)} bytes)…")
+                try:
+                    result = IMMICH.upload_with_retry(
+                        buf,
+                        filename,
+                        created,
+                        modified,
+                        device_asset_id=(
+                            f"{camera_label}/{path}".strip("/") or f"0x{rec.handle:08X}"
+                        ),
+                    )
+                except ImmichError as e:
+                    log(f"  immich upload failed; not recorded: {e}")
+                    if e.fatal:
+                        log("  Immich rejected the credentials; stopping this session")
+                        return
+                    continue
+                asset_id = result["id"]
                 if HISTORY:
-                    HISTORY.add(camera_id, camera_label, meta, fn, sha, head_sha)
+                    HISTORY.add_immich(
+                        camera_id,
+                        camera_label,
+                        meta,
+                        IMMICH.url,
+                        asset_id,
+                        result["status"],
+                        sha,
+                        head_sha,
+                    )
                 log(
-                    f"  saved {fn} ({len(buf)} bytes) "
-                    f"sha256={sha} head_sha256={head_sha}"
+                    f"  uploaded {filename} ({len(buf)} bytes) -> asset {asset_id} "
+                    f"({result['status']}) sha256={sha}"
                 )
+                if IMMICH_ALBUM:
+                    try:
+                        album_id = IMMICH.ensure_album(IMMICH_ALBUM)
+                        IMMICH.add_to_album(album_id, [asset_id])
+                    except ImmichError as e:
+                        log(f"  immich album error: {e}")
 
         for _name, _rc, _ps, data in setup:  # includes the initial 0x9116 object table
             process(data)
@@ -263,17 +392,67 @@ def on_camera(d: dict, guid: str, pc_name: str):
 
 def main():
     global OUT_DIR, HISTORY, REDOWNLOAD_MISSING, FLAT, CAPTURE_DIR, CHUNK_SIZE, RCVBUF
-    ap = argparse.ArgumentParser()
+    global MODE, IMMICH, IMMICH_ALBUM
+    ap = argparse.ArgumentParser(
+        epilog=(
+            "Immich API key permissions: asset.upload (uploads); album.read, "
+            "album.create, albumAsset.create, asset.share (with --immich-album); "
+            "user.read optional (shows the account name)."
+        )
+    )
     ap.add_argument("--iface-ip", default=None)
     ap.add_argument("--http-port", type=int, default=2869)
-    ap.add_argument("--out", default="downloads")
+    destination = ap.add_mutually_exclusive_group()
+    destination.add_argument(
+        "-d",
+        "--dir",
+        "--out",
+        dest="dir",
+        default=None,
+        metavar="DIR",
+        help="write files under DIR (default: downloads)",
+    )
+    destination.add_argument(
+        "-i",
+        "--immich",
+        metavar="URL",
+        default=None,
+        help="upload files to an Immich instance instead of writing them to disk",
+    )
+    ap.add_argument(
+        "--immich-key",
+        default=None,
+        metavar="KEY",
+        help="Immich API key (default: IMMICH_API_KEY, then a key saved in state.json)",
+    )
+    ap.add_argument(
+        "--immich-album",
+        default=None,
+        metavar="NAME",
+        help="add every uploaded asset to this album, creating it if needed",
+    )
+    ap.add_argument(
+        "--immich-insecure",
+        action="store_true",
+        help="skip TLS certificate verification for Immich (self-signed HTTPS)",
+    )
+    ap.add_argument(
+        "--immich-save-key",
+        action="store_true",
+        help="store the Immich API key in state.json for future runs (mode 0600)",
+    )
+    ap.add_argument(
+        "--immich-forget-key",
+        action="store_true",
+        help="remove the saved Immich API key from state.json",
+    )
     ap.add_argument("--camera-ip", default=None, help="optional known camera IP probe")
     ap.add_argument(
         "--history",
         default=os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "history.json"
         ),
-        help="download history file (default: history.json next to this script)",
+        help="download/upload history file (default: history.json next to this script)",
     )
     ap.add_argument(
         "--redownload-missing",
@@ -283,7 +462,7 @@ def main():
     ap.add_argument(
         "--flat",
         action="store_true",
-        help="save as <out>/<filename> instead of <out>/<camera>/<folder>/<filename>",
+        help="save as <dir>/<filename> instead of <dir>/<camera>/<folder>/<filename>",
     )
     ap.add_argument(
         "--chunk-size",
@@ -307,19 +486,95 @@ def main():
         ap.error("--chunk-size must be positive")
     if args.rcvbuf < 0:
         ap.error("--rcvbuf must be zero or positive")
-    OUT_DIR = args.out
+
+    state = load_state()
+
+    if args.immich_save_key and not args.immich:
+        ap.error("--immich-save-key requires --immich")
+
+    if args.immich_forget_key:
+        try:
+            removed = _forget_immich_key(state)
+        except OSError as e:
+            ap.error(f"could not update {STATE_PATH}: {e}")
+        if removed:
+            print(f"immich: removed saved API key from {STATE_PATH}")
+        else:
+            print(f"immich: no saved API key in {STATE_PATH}")
+        if not args.immich:
+            return
+
+    if args.immich:
+        if args.redownload_missing:
+            ap.error("--redownload-missing is only valid with --dir")
+        if args.flat:
+            ap.error("--flat is only valid with --dir")
+        key = (args.immich_key or os.environ.get("IMMICH_API_KEY", "")).strip()
+        if not key:
+            key = _saved_immich_key(state)
+            if key:
+                print(f"immich: using saved API key from {STATE_PATH}")
+        if not key:
+            ap.error(
+                "--immich requires --immich-key, IMMICH_API_KEY, or a saved "
+                "key (run once with --immich-save-key)"
+            )
+        try:
+            client = ImmichClient(args.immich, key, insecure=args.immich_insecure)
+        except ValueError as e:
+            ap.error(str(e))
+        try:
+            user = client.check()
+        except ImmichError as e:
+            # 403 means the key is valid but lacks ``user.read``. Uploading can
+            # still work, so only reject bad credentials (401) and real errors.
+            if e.status == 403:
+                user = {}
+                print(f"immich: API key accepted; account details unavailable ({e})")
+            else:
+                ap.error(f"Immich check failed for {client.url}: {e}")
+        if args.immich_save_key:
+            try:
+                _store_immich_key(state, key)
+            except OSError as e:
+                ap.error(f"could not save Immich API key to {STATE_PATH}: {e}")
+            print(f"immich: API key saved to {STATE_PATH} (mode 0600)")
+        MODE = "immich"
+        IMMICH = client
+        IMMICH_ALBUM = args.immich_album
+        print(
+            f"immich: url={client.url} "
+            f"user={user.get('email') or user.get('name') or '?'} "
+            f"album={IMMICH_ALBUM or '-'}"
+        )
+        if IMMICH_ALBUM:
+            try:
+                album_id = client.ensure_album(IMMICH_ALBUM)
+            except ImmichError as e:
+                ap.error(f"Immich album {IMMICH_ALBUM!r} is not usable: {e}")
+            print(f"immich: album {IMMICH_ALBUM!r} id={album_id}")
+    else:
+        if args.immich_key:
+            ap.error("--immich-key requires --immich")
+        if args.immich_album:
+            ap.error("--immich-album requires --immich")
+        if args.immich_insecure:
+            ap.error("--immich-insecure requires --immich")
+        MODE = "dir"
+        OUT_DIR = args.dir or "downloads"
+
     REDOWNLOAD_MISSING = args.redownload_missing
     FLAT = args.flat
     CAPTURE_DIR = args.capture
     CHUNK_SIZE = args.chunk_size
     RCVBUF = args.rcvbuf
     HISTORY = DownloadHistory(args.history)
-    state = load_state()
     guid, pc_name = get_identity(state)
     iface_ip = args.iface_ip or guess_iface_ip()
+    dest = f"immich={IMMICH.url}" if MODE == "immich" else f"out={OUT_DIR}"
     print(
         f"identity: guid={guid} pc_name={pc_name} iface_ip={iface_ip} "
-        f"out={OUT_DIR} history={args.history}"
+        f"{dest} history={args.history}"
     )
     disc = Discovery(iface_ip, guid, pc_name, args.http_port)
     disc.camera_ip = args.camera_ip

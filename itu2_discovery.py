@@ -54,8 +54,30 @@ def load_state() -> dict:
 
 
 def save_state(st: dict) -> None:
-    with open(STATE_PATH, "w") as f:
-        json.dump(st, f, indent=2)
+    """Write state atomically with owner-only permissions.
+
+    ``state.json`` holds the pairing identity and may also hold an Immich API
+    key, so it must not be group/world readable.
+    """
+    tmp = f"{STATE_PATH}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(st, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_PATH)
+        try:
+            os.chmod(STATE_PATH, 0o600)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def get_identity(state: dict) -> tuple[str, str]:
