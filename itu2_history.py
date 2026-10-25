@@ -117,8 +117,13 @@ class DownloadHistory:
         saved_as: str,
         sha256: str,
         head_sha256: str = "",
+        converted: dict | None = None,
     ) -> None:
-        """Record a local file, preserving any Immich uploads already recorded."""
+        """Record a local file, preserving any Immich uploads already recorded.
+
+        ``sha256``/``head_sha256`` describe the camera-original bytes;
+        ``converted`` (when set) describes the derived file at ``saved_as``.
+        """
         if not meta.time1 and not meta.time2:
             self.log(f"history: not recording {meta.path!r} (no camera timestamps)")
             return
@@ -133,6 +138,10 @@ class DownloadHistory:
                     "downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 }
             )
+            if converted is not None:
+                entry["converted"] = converted
+            else:
+                entry.pop("converted", None)
             try:
                 self._save()
             except OSError as e:
@@ -148,11 +157,13 @@ class DownloadHistory:
         status: str,
         sha256: str,
         head_sha256: str = "",
+        converted: dict | None = None,
     ) -> None:
         """Record a successful upload, keeping any local copy entry intact.
 
         Uploads are keyed by normalized Immich base URL so switching between
-        instances does not incorrectly skip objects.
+        instances does not incorrectly skip objects. ``sha256`` describes the
+        camera-original bytes; ``converted`` describes the uploaded payload.
         """
         if not meta.time1 and not meta.time2:
             self.log(f"history: not recording {meta.path!r} (no camera timestamps)")
@@ -162,11 +173,14 @@ class DownloadHistory:
             entry.update(self._object_fields(meta))
             entry["sha256"] = sha256
             entry["head_sha256"] = head_sha256
-            entry.setdefault("immich", {})[url] = {
+            record = {
                 "asset_id": asset_id,
                 "status": status,
                 "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             }
+            if converted is not None:
+                record["converted"] = converted
+            entry.setdefault("immich", {})[url] = record
             try:
                 self._save()
             except OSError as e:

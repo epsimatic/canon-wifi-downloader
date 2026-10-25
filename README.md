@@ -4,7 +4,7 @@
 
 A set of scripts to pair & download photos and videos from a WiFi connected Canon DSLR camera via PTP/IP.
 
-***Warning: vibe-coded.** Everything except this README is assisted by a LLM agent and wasn't thoroughly checked by a human. It works perfectly for me but your mileage may vary.*
+***Warning: vibe-coded.** all the code and most of the docs are assisted by a LLM agent and wasn't thoroughly checked by a human. It works perfectly for me but your mileage may vary.*
 
 This is very much a PoC / work in progress right now. Expect only the basic downloading function to work. 
 
@@ -15,6 +15,7 @@ This is very much a PoC / work in progress right now. Expect only the basic down
   python3 itu2.py                      # save to ./downloads
   python3 itu2.py -d ~/Pictures/camera # save to a specific directory
   python3 itu2.py -i http://immich.local:2283 --immich-key KEY  # upload to Immich
+  python3 itu2.py --avif               # convert to AVIF after downloading
   ```
 2. In Canon camera, enter **Wireless settings** → **Wi-Fi settings: Enable** → **Auto send images to computer** → **Auto send: Enable** → **OK**
 3. Connect to your Wi-Fi → **IP address set: Auto** → **OK**
@@ -66,6 +67,14 @@ Create an API key in Immich (**Account/User Settings → API Keys → New API Ke
 
 Then pass the key with `--immich-key`, or export `IMMICH_API_KEY`. Use `--immich-key KEY --immich-save-key` to store key in settings.
 
-### Protocol docs:
+#### AVIF conversion
+
+Pass `--avif` to convert JPEG downloads to AVIF before saving or uploading. AVIF is typically 5–8× smaller than the camera JPEG at the default settings. The JPEG is **replaced** by the `.avif` file unless `--keep-original` is given.
+
+- Requires [`avifenc`](https://github.com/AOMediaCodec/libavif) from libavif: `brew install libavif` (macOS) or `apt install libavif-bin` (Debian/Ubuntu). Set `AVIFENC` to use a non-PATH binary.
+- Defaults: quality `55`, speed `4`, source chroma (4:2:0 for camera JPEGs). EXIF/XMP/ICC and capture metadata are preserved.
+- Only JPEG objects are converted; RAW (CR3) and movies are saved unchanged. If encoding fails for an object, the original JPEG is kept and a warning is logged.
+
+## Protocol docs:
 
 See [PROTOCOL.md](PROTOCOL.md)

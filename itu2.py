@@ -10,7 +10,8 @@ Usage:
     python3 itu2.py [--iface-ip 192.0.2.10] [--http-port 2869] [--debug]
                     [-d downloads | -i http://immich.local:2283]
                     [--immich-key KEY | IMMICH_API_KEY=KEY] [--immich-album NAME]
-                    [--flat]
+                    [--flat] [--avif [--avif-quality Q] [--avif-speed S]]
+                    [--keep-original]
 """
 
 from __future__ import annotations
@@ -26,6 +27,15 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from itu2_convert import (
+    DEFAULT_QUALITY as AVIF_DEFAULT_QUALITY,
+    DEFAULT_SPEED as AVIF_DEFAULT_SPEED,
+    ConversionError,
+    encode_avif,
+    encoder_version,
+    find_encoder,
+    looks_like_jpeg,
+)  # noqa: E402
 from itu2_discovery import (
     STATE_PATH,
     Discovery,
@@ -54,6 +64,12 @@ MODE = "dir"  # "dir" or "immich"
 IMMICH: ImmichClient | None = None
 IMMICH_ALBUM: str | None = None
 DEBUG = False
+AVIF = False
+AVIF_QUALITY = AVIF_DEFAULT_QUALITY
+AVIF_SPEED = AVIF_DEFAULT_SPEED
+AVIF_KEEP_ORIGINAL = False
+AVIFENC: str | None = None
+AVIFENC_VERSION = ""
 
 
 _UNSAFE_CHARS = set("/\\:*?\"<>|'")
@@ -116,6 +132,25 @@ def _unique_path(path: str) -> str:
         if not os.path.exists(candidate):
             return candidate
     raise RuntimeError(f"no free filename for {path!r}")
+
+
+def _write_atomic(path: str, data: bytes) -> None:
+    """Write ``data`` to ``path`` via a ``.part`` file and an atomic rename."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _with_avif_ext(camera_path: str, handle: int) -> str:
+    """Camera path with its extension replaced by ``.avif``."""
+    if not (camera_path or "").strip("/"):
+        return f"0x{handle:08X}.avif"
+    stem, _ext = posixpath.splitext(camera_path)
+    return stem + ".avif"
 
 
 def _set_mtime(path: str, stamp: str) -> None:
@@ -309,29 +344,83 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                 sha = hashlib.sha256(buf).hexdigest()
                 head_sha = hashlib.sha256(buf[:65536]).hexdigest()
 
+                payload = buf
+                out_path = path
+                converted: dict | None = None
+                if AVIF and looks_like_jpeg(buf):
+                    try:
+                        avif = encode_avif(
+                            buf,
+                            encoder=AVIFENC or "avifenc",
+                            quality=AVIF_QUALITY,
+                            speed=AVIF_SPEED,
+                        )
+                    except ConversionError as e:
+                        log(f"  avif conversion failed; keeping JPEG: {e}")
+                    else:
+                        payload = avif
+                        out_path = _with_avif_ext(path, rec.handle)
+                        converted = {
+                            "format": "avif",
+                            "encoder": "avifenc",
+                            "version": AVIFENC_VERSION,
+                            "quality": AVIF_QUALITY,
+                            "speed": AVIF_SPEED,
+                            "sha256": hashlib.sha256(avif).hexdigest(),
+                            "size": len(avif),
+                        }
+                        log(
+                            f"  avif: {len(buf)} -> {len(avif)} bytes "
+                            f"({len(avif) * 100.0 / len(buf):.1f}% of JPEG)"
+                        )
+                elif AVIF:
+                    dbg(f"  not a JPEG ({path!r}); keeping the original object")
+
                 if MODE == "dir":
                     with _output_lock:
-                        fn = _unique_path(_output_path(camera_label, path, rec.handle))
-                        os.makedirs(os.path.dirname(fn), exist_ok=True)
-                        tmp = fn + ".part"
-                        with open(tmp, "wb") as f:
-                            f.write(buf)
-                            f.flush()
-                            os.fsync(f.fileno())
-                        os.replace(tmp, fn)
+                        if converted is not None and AVIF_KEEP_ORIGINAL:
+                            fn = _unique_path(
+                                _output_path(camera_label, path, rec.handle)
+                            )
+                            avif_fn = os.path.splitext(fn)[0] + ".avif"
+                            if os.path.exists(avif_fn):
+                                avif_fn = _unique_path(avif_fn)
+                            _write_atomic(fn, buf)
+                            _write_atomic(avif_fn, payload)
+                            converted["original_path"] = fn
+                            fn = avif_fn
+                        else:
+                            fn = _unique_path(
+                                _output_path(camera_label, out_path, rec.handle)
+                            )
+                            _write_atomic(fn, payload)
                     _set_mtime(fn, meta.time2 or meta.time1)
+                    if converted is not None:
+                        converted["path"] = fn
+                        if AVIF_KEEP_ORIGINAL:
+                            _set_mtime(
+                                converted["original_path"], meta.time2 or meta.time1
+                            )
                     if HISTORY:
-                        HISTORY.add(camera_id, camera_label, meta, fn, sha, head_sha)
-                    log(f"  saved {fn} ({len(buf)} bytes)")
+                        HISTORY.add(
+                            camera_id,
+                            camera_label,
+                            meta,
+                            fn,
+                            sha,
+                            head_sha,
+                            converted=converted,
+                        )
+                    log(f"  saved {fn} ({len(payload)} bytes)")
                     dbg(f"  sha256={sha} head_sha256={head_sha}")
                     continue
 
-                filename = _upload_filename(path, rec.handle)
+                filename = _upload_filename(out_path, rec.handle)
                 created, modified = _upload_timestamps(meta)
-                log(f"  uploading {filename} ({len(buf)} bytes)…")
+                log(f"  uploading {filename} ({len(payload)} bytes)…")
                 try:
                     result = IMMICH.upload_with_retry(
-                        buf,
+                        payload,
                         filename,
                         created,
                         modified,
@@ -346,6 +435,8 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                         return
                     continue
                 asset_id = result["id"]
+                if converted is not None:
+                    converted["filename"] = filename
                 if HISTORY:
                     HISTORY.add_immich(
                         camera_id,
@@ -356,9 +447,10 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
                         result["status"],
                         sha,
                         head_sha,
+                        converted=converted,
                     )
                 log(
-                    f"  uploaded {filename} ({len(buf)} bytes) -> asset {asset_id} "
+                    f"  uploaded {filename} ({len(payload)} bytes) -> asset {asset_id} "
                     f"({result['status']})"
                 )
                 dbg(f"  sha256={sha}")
@@ -408,6 +500,7 @@ def on_camera(d: dict, guid: str, pc_name: str):
 def main():
     global OUT_DIR, HISTORY, REDOWNLOAD_MISSING, FLAT, CAPTURE_DIR, CHUNK_SIZE, RCVBUF
     global MODE, IMMICH, IMMICH_ALBUM, DEBUG
+    global AVIF, AVIF_QUALITY, AVIF_SPEED, AVIF_KEEP_ORIGINAL, AVIFENC, AVIFENC_VERSION
     ap = argparse.ArgumentParser(
         epilog=(
             "Immich API key permissions: asset.upload (uploads); album.read, "
@@ -485,6 +578,33 @@ def main():
         help="save as <dir>/<filename> instead of <dir>/<camera>/<folder>/<filename>",
     )
     ap.add_argument(
+        "--avif",
+        action="store_true",
+        help=(
+            "convert JPEG objects to AVIF (q55, speed 4, source chroma) and use "
+            ".avif as the stored/uploaded file; requires avifenc from libavif"
+        ),
+    )
+    ap.add_argument(
+        "--avif-quality",
+        type=int,
+        default=None,
+        metavar="Q",
+        help="avifenc color quality 0..100 (default: 55; requires --avif)",
+    )
+    ap.add_argument(
+        "--avif-speed",
+        type=int,
+        default=None,
+        metavar="S",
+        help="avifenc speed 0..10, 0 slowest (default: 4; requires --avif)",
+    )
+    ap.add_argument(
+        "--keep-original",
+        action="store_true",
+        help="with --avif and --dir, keep the JPEG next to the AVIF",
+    )
+    ap.add_argument(
         "--chunk-size",
         type=int,
         default=0x200000,
@@ -507,6 +627,30 @@ def main():
         ap.error("--chunk-size must be positive")
     if args.rcvbuf < 0:
         ap.error("--rcvbuf must be zero or positive")
+
+    quality = AVIF_DEFAULT_QUALITY if args.avif_quality is None else args.avif_quality
+    speed = AVIF_DEFAULT_SPEED if args.avif_speed is None else args.avif_speed
+    if args.avif_quality is not None and not args.avif:
+        ap.error("--avif-quality requires --avif")
+    if args.avif_speed is not None and not args.avif:
+        ap.error("--avif-speed requires --avif")
+    if args.keep_original and not args.avif:
+        ap.error("--keep-original requires --avif")
+    if args.keep_original and args.immich:
+        ap.error("--keep-original is only valid with --dir")
+    if not 0 <= quality <= 100:
+        ap.error("--avif-quality must be between 0 and 100")
+    if not 0 <= speed <= 10:
+        ap.error("--avif-speed must be between 0 and 10")
+    if args.avif:
+        AVIFENC = find_encoder()
+        if not AVIFENC:
+            ap.error(
+                "--avif requires avifenc from libavif. Install it with "
+                "'brew install libavif' (macOS) or 'apt install libavif-bin' "
+                "(Debian/Ubuntu), set AVIFENC to its path, or run without --avif."
+            )
+        AVIFENC_VERSION = encoder_version(AVIFENC)
 
     state = load_state()
 
@@ -589,13 +733,24 @@ def main():
     CAPTURE_DIR = args.capture
     CHUNK_SIZE = args.chunk_size
     RCVBUF = args.rcvbuf
+    AVIF = args.avif
+    AVIF_QUALITY = quality
+    AVIF_SPEED = speed
+    AVIF_KEEP_ORIGINAL = args.keep_original
     HISTORY = DownloadHistory(args.history)
     guid, pc_name = get_identity(state)
     iface_ip = args.iface_ip or guess_iface_ip()
     dest = f"immich={IMMICH.url}" if MODE == "immich" else f"out={OUT_DIR}"
+    avif_info = ""
+    if AVIF:
+        avif_info = (
+            f" avif=q{AVIF_QUALITY}/s{AVIF_SPEED} encoder={AVIFENC_VERSION or AVIFENC}"
+        )
+        if AVIF_KEEP_ORIGINAL:
+            avif_info += " keep-original"
     print(
         f"identity: guid={guid} pc_name={pc_name} iface_ip={iface_ip} "
-        f"{dest} history={args.history}"
+        f"{dest} history={args.history}{avif_info}"
     )
     disc = Discovery(iface_ip, guid, pc_name, args.http_port, debug=args.debug)
     disc.camera_ip = args.camera_ip
