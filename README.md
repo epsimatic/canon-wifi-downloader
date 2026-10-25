@@ -10,7 +10,7 @@ This is very much a PoC / work in progress right now. Expect only the basic down
 
 ### Usage instructions:
 
-1. Start the script (see **Destinations** below for where files go):   
+1. Start the script:   
   ```bash
   python3 itu2.py                      # save to ./downloads
   python3 itu2.py -d ~/Pictures/camera # save to a specific directory
@@ -67,7 +67,7 @@ Create an API key in Immich (**Account/User Settings → API Keys → New API Ke
 
 Then pass the key with `--immich-key`, or export `IMMICH_API_KEY`. Use `--immich-key KEY --immich-save-key` to store key in settings.
 
-#### AVIF conversion
+### AVIF conversion
 
 Pass `--avif` to convert JPEG downloads to AVIF before saving or uploading. AVIF is typically 5–8× smaller than the camera JPEG at the default settings. The JPEG is **replaced** by the `.avif` file unless `--keep-original` is given.
 

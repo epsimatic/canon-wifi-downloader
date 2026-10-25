@@ -260,6 +260,7 @@ def session(ip: str, guid: str, pc_name: str, mode: str):
             log("completing pairing…")
             cli.finish_pairing()
             log("pairing done")
+            log("Power off, then power on the camera to start image transfer")
             return
         # Transfer
         if MODE == "immich" and IMMICH is None:

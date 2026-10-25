@@ -435,9 +435,7 @@ class Discovery:
         label = "camera" if is_camera else "peer host"
         state = "paired to us" if paired else "not paired to us"
         if is_camera:
-            summary = (
-                f"camera {d['ip']} name={d['friendlyName']!r} mode={mode} ({state})"
-            )
+            summary = f"camera {d['ip']} {d['friendlyName']} {d['nickname']!r} will {mode} ({state})"
             if self._last_summary.get(src) != summary:
                 self._last_summary[src] = summary
                 self.log(f"  {summary}")
